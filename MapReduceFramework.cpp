@@ -8,7 +8,6 @@
 #include "MapReduceFramework.h"
 #include <atomic>
 #include <queue>
-#include "semaphore.h"
 #include <algorithm>
 
 struct JobContext;
