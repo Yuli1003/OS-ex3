@@ -1,7 +1,6 @@
-#include <thread>        // std::thread
-#include <mutex>         // std::mutex, std::lock_guard
-#include <condition_variable> // std::condition_variable
-#include <chrono>        // clocks and durations
+#include <thread>
+#include <mutex>
+#include <condition_variable>
 #include <vector>
 #include <iostream>
 #include "Barrier.h"
@@ -10,6 +9,7 @@
 #include <atomic>
 #include <queue>
 #include "semaphore.h"
+#include <algorithm>
 
 struct JobContext;
 
@@ -31,38 +31,178 @@ typedef struct JobContext
     std::atomic<uint64_t> jobStatus;
     bool isWaiting;
 
-    std::mutex inputMtx;
     std::mutex outputMtx;
-
     std::mutex undefStageMtx;
     std::mutex mapStageMtx;
+    std::mutex shuffleMtx;
     std::mutex reduceStageMtx;
 
     Barrier *pre_barrier;
     Barrier *post_barrier;
 
-    std::atomic<size_t> nextMapIdx{0};
-    std::mutex shuffleMtx;
-    std::condition_variable shuffleCv;
-    std::queue<IntermediateVec> shuffleQueue;
+    std::queue<IntermediateVec *> *reduceQueue;
 
 } JobContext;
 
+uint64_t doneJob (ThreadContext *context)
+{
+  return ((context->job_context->jobStatus << 31) >> 33);
+}
+
+uint64_t totalJob (ThreadContext *context)
+{
+  return (context->job_context->jobStatus >> 33);
+}
+
+K2 *maxCurKeyOfAllThreads (JobContext *jobContext)
+{
+  K2 *curMax = jobContext->threads_context->at (0)->working_vec->back ().first;
+  for (auto &thread: *jobContext->threads_context)
+  {
+    K2 *curLast = thread->working_vec->back ().first;
+    if (curLast > curMax)
+    {
+      curMax = curLast;
+    }
+  }
+  return curMax;
+}
+
+void shuffleAll (ThreadContext *context)
+{
+  context->job_context->reduceQueue = new std::queue<IntermediateVec *> ();
+  while (doneJob (context) < totalJob (context))
+  {
+    K2 *maxKey = maxCurKeyOfAllThreads (context->job_context);
+    auto *newVec = new IntermediateVec ();
+    for (auto &thread: *context->job_context->threads_context)
+    {
+      while (thread->working_vec->back ().first == maxKey)
+      {
+        newVec->push_back (thread->working_vec->back ());
+        thread->working_vec->pop_back ();
+        context->job_context->jobStatus += (1 << 2);
+      }
+    }
+    context->job_context->reduceQueue->push (newVec);
+  }
+}
+
+void sortAndShuffleVec (ThreadContext *context)
+{
+  std::sort (context->working_vec->begin (), context->working_vec->end (),
+             [] (auto &a, auto &b)
+             {
+                 return *(a.first) < *(b.first);
+             });
+  context->job_context->pre_barrier->barrier ();
+
+  context->job_context->shuffleMtx.lock ();
+  if ((context->job_context->jobStatus & 3) != SHUFFLE_STAGE)
+  {
+    context->job_context->jobStatus += 1;
+    auto doneJob = (((context->job_context->jobStatus << 31) >> 33) << 2);
+    context->job_context->jobStatus -= doneJob;
+  }
+  context->job_context->shuffleMtx.unlock ();
+
+  if (context->id == 0)
+  {
+    shuffleAll (context);
+  }
+  context->job_context->post_barrier->barrier ();
+}
+
 void runRoutine (ThreadContext *context)
 {
-  // undefined stage
+  JobContext *jobContext = context->job_context;
+  bool moreToMap, moreToReduce;
+  while (true)
+  {
+    uint64_t jobStatus = jobContext->jobStatus;
 
-  // map stage
+    // undefined stage
+    jobContext->undefStageMtx.lock ();
+    if ((jobStatus & 3) == UNDEFINED_STAGE)
+    {
+      jobContext->jobStatus += 1;
+      jobContext->jobStatus += ((jobContext->input_vec->size ()) << 33);
+    }
+    jobContext->undefStageMtx.unlock ();
 
-  // reduce stage
+    // map stage
+    if ((jobStatus & 3) == MAP_STAGE)
+    {
+      jobContext->mapStageMtx.lock ();
+      auto totalJob = ((jobContext->jobStatus) >> 33);
+      auto doneJob = (((jobContext->jobStatus) << 31) >> 33);
+      uint64_t nextJob;
+      if (doneJob < totalJob)
+      {
+        moreToMap = true;
+        nextJob = doneJob + 1;
+        jobContext->jobStatus += (1 << 2);
+      }
+      else
+      {
+        moreToMap = false;
+      }
+      jobContext->mapStageMtx.unlock ();
+
+      if (moreToMap)
+      {
+        auto pair = jobContext->input_vec->at (nextJob);
+        jobContext->client->map (pair.first, pair.second, context);
+      }
+      else
+      {
+        sortAndShuffleVec (context);
+      }
+    }
+
+    // reduce stage
+    context->job_context->reduceStageMtx.lock ();
+    if ((context->job_context->jobStatus & 3) != REDUCE_STAGE)
+    {
+      context->job_context->jobStatus += 1;
+      auto doneJob = (((context->job_context->jobStatus << 31) >> 33) << 2);
+      context->job_context->jobStatus -= doneJob;
+    }
+    context->job_context->reduceStageMtx.unlock ();
+
+    if ((jobStatus & 3) == REDUCE_STAGE)
+    {
+      jobContext->reduceStageMtx.lock ();
+      IntermediateVec *nextJob;
+      if (doneJob (context) < totalJob (context))
+      {
+        moreToReduce = true;
+        nextJob = context->job_context->reduceQueue->front ();
+        context->job_context->reduceQueue->pop ();
+        jobContext->jobStatus += ((nextJob->size ()) << 2);
+      }
+      else
+      {
+        moreToReduce = false;
+      }
+      jobContext->reduceStageMtx.unlock ();
+
+      if (moreToReduce)
+      {
+        jobContext->client->reduce (nextJob, context);
+      }
+      else
+      {
+        break;
+      }
+    }
+  }
 }
 
 JobHandle startMapReduceJob (const MapReduceClient &client,
                              const InputVec &inputVec, OutputVec &outputVec,
                              int multiThreadLevel)
 {
-  // job state
-
   auto *job_context = new JobContext ();
 
   job_context->client = &client;
@@ -80,7 +220,7 @@ JobHandle startMapReduceJob (const MapReduceClient &client,
 
   for (int i = 0; i < multiThreadLevel; i++)
   {
-    auto *context = new ThreadContext{job_context, i, nullptr};
+    auto *context = new ThreadContext{job_context, i, new IntermediateVec ()};
     job_context->threads->push_back (new std::thread (runRoutine, context));
     job_context->threads_context->push_back (context);
   }
@@ -132,7 +272,31 @@ void getJobState (JobHandle job, JobState *state)
 
 void closeJobHandle (JobHandle job)
 {
+  if (job == nullptr)
+  {
+    std::cerr << "system error: Invalid JobHandle";
+    return;
+  }
 
+  auto *jobContext = (JobContext *) job;
+
+  for (auto &threadContext: *jobContext->threads_context)
+  {
+    delete threadContext->working_vec;
+    delete threadContext;
+  }
+  for (auto &thread: *jobContext->threads)
+  {
+    delete thread;
+  }
+
+  delete jobContext->threads_context;
+  delete jobContext->threads;
+  delete jobContext->reduceQueue;
+  delete jobContext->pre_barrier;
+  delete jobContext->post_barrier;
+
+  delete jobContext;
 }
 
 void emit2 (K2 *key, V2 *value, void *context)
