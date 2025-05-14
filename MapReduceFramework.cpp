@@ -108,7 +108,7 @@ void sortAndShuffleVec (ThreadContext *context)
 {
   context->job_context->newPairsCounter += context->working_vec->size ();
   std::sort (context->working_vec->begin (), context->working_vec->end (),
-             [] (auto &a, auto &b)
+             [] (IntermediatePair &a, IntermediatePair &b)
              {
 
                  return *(a.first) < *(b.first);
@@ -230,6 +230,11 @@ JobHandle startMapReduceJob (const MapReduceClient &client,
                              const InputVec &inputVec, OutputVec &outputVec,
                              int multiThreadLevel)
 {
+  if ( (uint64_t )multiThreadLevel >= ((((uint64_t )1)<<32)-1))
+  {
+    std::cerr<<"system error: Invalid number of of threads.\n";
+    exit(1);
+  }
   auto *job_context = new JobContext ();
 
   job_context->client = &client;
