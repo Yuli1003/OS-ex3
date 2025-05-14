@@ -110,6 +110,7 @@ void sortAndShuffleVec (ThreadContext *context)
   std::sort (context->working_vec->begin (), context->working_vec->end (),
              [] (auto &a, auto &b)
              {
+
                  return *(a.first) < *(b.first);
              });
 
