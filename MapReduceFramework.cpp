@@ -110,6 +110,7 @@ void shuffleAll (ThreadContext *context)
         );
       }
     }
+
     context->job_context->reduceQueue->push (newVec);
   }
 }
