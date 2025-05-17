@@ -110,10 +110,7 @@ void shuffleAll (ThreadContext *context)
         );
       }
     }
-    {
-      std::lock_guard<std::mutex> g( context->job_context->shuffleMtx);
-      context->job_context->reduceQueue->push (newVec);
-    }
+    context->job_context->reduceQueue->push (newVec);
   }
 }
 
@@ -232,27 +229,24 @@ void runRoutine (ThreadContext *context)
 
     if ((jobContext->jobStatus.load () & 0b11) == REDUCE_STAGE)
     {
-
+      jobContext->reduceStageMtx.lock ();
       IntermediateVec *nextJob;
       if (doneJob (context) < totalJob (context))
       {
-        std::lock_guard<std::mutex> g (context->job_context->shuffleMtx);
-        if (!jobContext->reduceQueue->empty ())
-        {
-          moreToReduce = true;
-          nextJob = context->job_context->reduceQueue->front ();
-          context->job_context->reduceQueue->pop ();
-          //jobContext->jobStatus += ((nextJob->size ()) << 2);
-          jobContext->jobStatus.fetch_add (
-              1ULL << 2,
-              std::memory_order_acq_rel
-          );
-        }
-        else
-        {
-          moreToReduce = false;
-        }
+        moreToReduce = true;
+        nextJob = context->job_context->reduceQueue->front ();
+        context->job_context->reduceQueue->pop ();
+        //jobContext->jobStatus += ((nextJob->size ()) << 2);
+        jobContext->jobStatus.fetch_add(
+            1ULL << 2,
+            std::memory_order_acq_rel
+        );
       }
+      else
+      {
+        moreToReduce = false;
+      }
+      jobContext->reduceStageMtx.unlock ();
 
       if (moreToReduce)
       {
