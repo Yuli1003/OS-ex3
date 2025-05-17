@@ -10,6 +10,11 @@
 #include <queue>
 #include <algorithm>
 
+static constexpr int MAX_REASONABLE_THREAD_COUNT = 10000;
+static constexpr uint64_t DONE_MASK  = ((1ULL<<31)-1) << 2;
+static constexpr uint64_t TOTAL_MASK = ~((1ULL<<33)-1);
+
+
 struct JobContext;
 
 typedef struct ThreadContext
@@ -48,12 +53,16 @@ typedef struct JobContext
 
 uint64_t doneJob (ThreadContext *context)
 {
-  return ((context->job_context->jobStatus.load () << 31) >> 33);
+//  return ((context->job_context->jobStatus.load () << 31) >> 33);
+  uint64_t s = context->job_context->jobStatus.load();
+  return (s & DONE_MASK) >> 2;
 }
 
 uint64_t totalJob (ThreadContext *context)
 {
-  return (context->job_context->jobStatus.load () >> 33);
+//  return (context->job_context->jobStatus.load () >> 33);
+  uint64_t s = context->job_context->jobStatus.load();
+  return (s & TOTAL_MASK) >> 33;
 }
 
 K2 *maxCurKeyOfAllThreads (JobContext *jobContext)
@@ -76,7 +85,8 @@ K2 *maxCurKeyOfAllThreads (JobContext *jobContext)
 
 void shuffleAll (ThreadContext *context)
 {
-  context->job_context->reduceQueue = new std::queue<IntermediateVec *> ();
+  //context->job_context->reduceQueue = new std::queue<IntermediateVec *> ();
+
   while (doneJob (context) < totalJob (context))
   {
     K2 *maxKey = maxCurKeyOfAllThreads (context->job_context);
@@ -86,7 +96,6 @@ void shuffleAll (ThreadContext *context)
     {
       if (thread->working_vec->empty ())
       {
-        //context->job_context->jobStatus += (1 << 2);
         continue;
       }
       while (!thread->working_vec->empty () &&
@@ -95,21 +104,28 @@ void shuffleAll (ThreadContext *context)
       {
         newVec->push_back (thread->working_vec->back ());
         thread->working_vec->pop_back ();
-        context->job_context->jobStatus += (1 << 2);
+        context->job_context->jobStatus.fetch_add(
+            1ULL << 2,
+            std::memory_order_acq_rel
+        );
       }
     }
-
-    context->job_context->reduceQueue->push (newVec);
+    {
+      std::lock_guard<std::mutex> g( context->job_context->shuffleMtx);
+      context->job_context->reduceQueue->push (newVec);
+    }
   }
 }
 
 void sortAndShuffleVec (ThreadContext *context)
 {
-  context->job_context->newPairsCounter += context->working_vec->size ();
+  context->job_context->newPairsCounter.fetch_add(
+            context->working_vec->size(),
+            std::memory_order_relaxed);
+
   std::sort (context->working_vec->begin (), context->working_vec->end (),
              [] (IntermediatePair &a, IntermediatePair &b)
              {
-
                  return *(a.first) < *(b.first);
              });
 
@@ -117,15 +133,23 @@ void sortAndShuffleVec (ThreadContext *context)
 
   if (context->id == 0)
   {
-    if ((context->job_context->jobStatus.load () & 0b11) != SHUFFLE_STAGE)
-    {
-      context->job_context->jobStatus.store (SHUFFLE_STAGE);
-      context->job_context->jobStatus +=
-          ((context->job_context->newPairsCounter.load ()) << 33);
+//    if ((context->job_context->jobStatus.load () & 0b11) != SHUFFLE_STAGE)
+//    {
+//      context->job_context->jobStatus.store (SHUFFLE_STAGE);
+//      context->job_context->jobStatus +=
+//          ((context->job_context->newPairsCounter.load ()) << 33);
+    uint64_t packed = (uint64_t(SHUFFLE_STAGE) & 0b11)
+                      | (context->job_context->newPairsCounter.load() << 33);
+    context->job_context->jobStatus.store(packed, std::memory_order_release);
 
-    }
     shuffleAll (context);
 
+    size_t totalSize = context->job_context->reduceQueue->size();
+    uint64_t packedReduce =
+        (uint64_t(REDUCE_STAGE) & 0b11)
+        | ( uint64_t(totalSize) << 33 );
+    context->job_context->jobStatus.store(packedReduce,
+                                      std::memory_order_release);
   }
 
   context->job_context->post_barrier->barrier ();
@@ -145,9 +169,16 @@ void runRoutine (ThreadContext *context)
     if ((jobContext->jobStatus.load () & 0b11) == UNDEFINED_STAGE &&
         jobContext->inUndefinedStage)
     {
-      jobContext->jobStatus += MAP_STAGE;
+      //jobContext->jobStatus += MAP_STAGE;
       jobContext->inUndefinedStage = false;
-      jobContext->jobStatus += ((jobContext->input_vec->size ()) << 33);
+      //jobContext->jobStatus += ((jobContext->input_vec->size ()) << 33);
+      size_t totalSize = ((jobContext->input_vec->size ()));
+      uint64_t packedMap =
+          (uint64_t(MAP_STAGE) & 0b11)
+          | ( uint64_t(totalSize) << 33 );
+      context->job_context->jobStatus.store(packedMap,
+                                            std::memory_order_release);
+
     }
     jobContext->undefStageMtx.unlock ();
 
@@ -162,7 +193,10 @@ void runRoutine (ThreadContext *context)
       {
         moreToMap = true;
         nextJob = doneJob (context);
-        jobContext->jobStatus += (1 << 2);
+        jobContext->jobStatus.fetch_add(
+            1ULL << 2,
+            std::memory_order_acq_rel
+        );
       }
       else
       {
@@ -185,37 +219,45 @@ void runRoutine (ThreadContext *context)
     }
 
     // reduce stage
-    context->job_context->reduceStageMtx.lock ();
-    if ((context->job_context->jobStatus.load () & 0b11) != REDUCE_STAGE &&
-        sortedAndShuffled)
-    {
-      context->job_context->jobStatus.store (REDUCE_STAGE);
-      context->job_context->jobStatus +=
-          ((context->job_context->newPairsCounter.load ()) << 33);
-
-    }
-    context->job_context->reduceStageMtx.unlock ();
+//    context->job_context->reduceStageMtx.lock ();
+//    if ((context->job_context->jobStatus.load () & 0b11) != REDUCE_STAGE &&
+//        sortedAndShuffled)
+//    {
+//      context->job_context->jobStatus.store (REDUCE_STAGE);
+//      context->job_context->jobStatus +=
+//          ((context->job_context->newPairsCounter.load ()) << 33);
+//
+//    }
+//    context->job_context->reduceStageMtx.unlock ();
 
     if ((jobContext->jobStatus.load () & 0b11) == REDUCE_STAGE)
     {
-      jobContext->reduceStageMtx.lock ();
+
       IntermediateVec *nextJob;
       if (doneJob (context) < totalJob (context))
       {
-        moreToReduce = true;
-        nextJob = context->job_context->reduceQueue->front ();
-        context->job_context->reduceQueue->pop ();
-        jobContext->jobStatus += ((nextJob->size ()) << 2);
+        std::lock_guard<std::mutex> g (context->job_context->shuffleMtx);
+        if (!jobContext->reduceQueue->empty ())
+        {
+          moreToReduce = true;
+          nextJob = context->job_context->reduceQueue->front ();
+          context->job_context->reduceQueue->pop ();
+          //jobContext->jobStatus += ((nextJob->size ()) << 2);
+          jobContext->jobStatus.fetch_add (
+              1ULL << 2,
+              std::memory_order_acq_rel
+          );
+        }
+        else
+        {
+          moreToReduce = false;
+        }
       }
-      else
-      {
-        moreToReduce = false;
-      }
-      jobContext->reduceStageMtx.unlock ();
 
       if (moreToReduce)
       {
         jobContext->client->reduce (nextJob, context);
+        delete nextJob;
       }
       else
       {
@@ -229,11 +271,11 @@ JobHandle startMapReduceJob (const MapReduceClient &client,
                              const InputVec &inputVec, OutputVec &outputVec,
                              int multiThreadLevel)
 {
-  if ( (uint64_t )multiThreadLevel >= ((((uint64_t )1)<<32)-1))
-  {
-    std::cerr<<"system error: Invalid number of of threads.\n";
-    exit(1);
+  if (multiThreadLevel <= 0 || multiThreadLevel > MAX_REASONABLE_THREAD_COUNT) {
+    std::cout << "system error: Invalid number of threads.\n";
+    std::exit(1);
   }
+
   auto *job_context = new JobContext ();
 
   job_context->client = &client;
@@ -249,6 +291,7 @@ JobHandle startMapReduceJob (const MapReduceClient &client,
 
   job_context->threads_context = new std::vector<ThreadContext *> ();
   job_context->threads = new std::vector<std::thread *> ();
+  job_context->reduceQueue = new std::queue<IntermediateVec*>();
 
   job_context->newPairsCounter.store (0);
 
@@ -289,17 +332,19 @@ void getJobState (JobHandle job, JobState *state)
   }
 
   auto jobContext = (JobContext *) job;
+  uint64_t s = jobContext->jobStatus.load(std::memory_order_acquire);
 
-  state->stage = static_cast<stage_t>(jobContext->jobStatus.load () & 3);
+  state->stage = static_cast<stage_t>(s & 3);
   if (state->stage == UNDEFINED_STAGE)
   {
-    state->percentage = 0;
+    state->percentage = 0.0f;
   }
   else
   {
-    uint64_t totalJob = (jobContext->jobStatus.load () >> 33);
-    uint64_t doneJob = ((jobContext->jobStatus.load () << 31) >> 33);
-    state->percentage = ((float) doneJob / (float) totalJob) * 100;
+    uint64_t done  = (s & DONE_MASK)  >> 2;
+    uint64_t total = (s & TOTAL_MASK) >> 33;
+    state->percentage = (total == 0 ? 0.0f
+                                 : float(done) / float(total) * 100.0f);
   }
 }
 
@@ -339,6 +384,7 @@ void emit2 (K2 *key, V2 *value, void *context)
     std::cerr << "system error: Invalid args for emit2";
     return;
   }
+
   auto threadContext = (ThreadContext *) context;
   threadContext->working_vec->emplace_back (key, value);
 }
