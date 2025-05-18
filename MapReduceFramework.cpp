@@ -91,7 +91,12 @@ void shuffleAll (ThreadContext *context)
   {
     K2 *maxKey = maxCurKeyOfAllThreads (context->job_context);
 
+    if (maxKey == nullptr) {
+      break;
+    }
+
     auto *newVec = new IntermediateVec ();
+    bool added_something = false;
     for (auto &thread: *context->job_context->threads_context)
     {
       if (thread->working_vec->empty ())
@@ -108,10 +113,19 @@ void shuffleAll (ThreadContext *context)
             1ULL << 2,
             std::memory_order_acq_rel
         );
+        added_something = true;
       }
     }
+    if (added_something) {
+      context->job_context->reduceQueue->push(newVec);
+    } else {
+      delete newVec; // Clean up if we didn't use it
+    }
 
-    context->job_context->reduceQueue->push (newVec);
+    // Recheck the condition to avoid infinite loops
+    if (maxCurKeyOfAllThreads(context->job_context) == nullptr) {
+      break;
+    }
   }
 }
 
@@ -131,11 +145,6 @@ void sortAndShuffleVec (ThreadContext *context)
 
   if (context->id == 0)
   {
-//    if ((context->job_context->jobStatus.load () & 0b11) != SHUFFLE_STAGE)
-//    {
-//      context->job_context->jobStatus.store (SHUFFLE_STAGE);
-//      context->job_context->jobStatus +=
-//          ((context->job_context->newPairsCounter.load ()) << 33);
     uint64_t packed = (uint64_t(SHUFFLE_STAGE) & 0b11)
                       | (context->job_context->newPairsCounter.load() << 33);
     context->job_context->jobStatus.store(packed, std::memory_order_release);
@@ -174,7 +183,7 @@ void runRoutine (ThreadContext *context)
       uint64_t packedMap =
           (uint64_t(MAP_STAGE) & 0b11)
           | ( uint64_t(totalSize) << 33 );
-      context->job_context->jobStatus.store(packedMap,
+      jobContext->jobStatus.store(packedMap,
                                             std::memory_order_release);
 
     }
@@ -232,11 +241,12 @@ void runRoutine (ThreadContext *context)
     {
       jobContext->reduceStageMtx.lock ();
       IntermediateVec *nextJob;
-      if (doneJob (context) < totalJob (context))
+      if (doneJob (context) < totalJob (context) &&
+      !jobContext->reduceQueue->empty())
       {
         moreToReduce = true;
-        nextJob = context->job_context->reduceQueue->front ();
-        context->job_context->reduceQueue->pop ();
+        nextJob = jobContext->reduceQueue->front ();
+        jobContext->reduceQueue->pop ();
         //jobContext->jobStatus += ((nextJob->size ()) << 2);
         jobContext->jobStatus.fetch_add(
             1ULL << 2,
@@ -252,7 +262,6 @@ void runRoutine (ThreadContext *context)
       if (moreToReduce)
       {
         jobContext->client->reduce (nextJob, context);
-        delete nextJob;
       }
       else
       {
