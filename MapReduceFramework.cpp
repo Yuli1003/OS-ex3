@@ -1,6 +1,5 @@
 #include <thread>
 #include <mutex>
-#include <condition_variable>
 #include <vector>
 #include <iostream>
 #include "Barrier.h"
@@ -18,19 +17,19 @@ struct JobContext;
 
 typedef struct ThreadContext
 {
-    JobContext *job_context;
+    JobContext *jobContext;
     int id;
-    IntermediateVec *working_vec;
+    IntermediateVec *workingVec;
 } ThreadContext;
 
 typedef struct JobContext
 {
-    std::vector<ThreadContext *> *threads_context;
+    std::vector<ThreadContext *> *threadsContext;
     std::vector<std::thread *> *threads;
 
     MapReduceClient const *client;
-    InputVec const *input_vec;
-    OutputVec *output_vec;
+    InputVec const *inputVec;
+    OutputVec *outputVec;
     std::atomic<uint64_t> jobStatus;
     bool isWaiting;
     bool inUndefinedStage;
@@ -40,8 +39,8 @@ typedef struct JobContext
     std::mutex mapStageMtx;
     std::mutex reduceStageMtx;
 
-    Barrier *pre_barrier;
-    Barrier *post_barrier;
+    Barrier *preBarrier;
+    Barrier *postBarrier;
 
     std::queue<IntermediateVec *> *reduceQueue;
 
@@ -51,37 +50,30 @@ typedef struct JobContext
 
 uint64_t doneJob (ThreadContext *context)
 {
-//  return ((context->job_context->jobStatus.load () << 31) >> 33);
-  uint64_t s = context->job_context->jobStatus.load ();
+  uint64_t s = context->jobContext->jobStatus.load ();
   return (s & DONE_MASK) >> 2;
 }
 
 uint64_t totalJob (ThreadContext *context)
 {
-//  return (context->job_context->jobStatus.load () >> 33);
-  uint64_t s = context->job_context->jobStatus.load ();
+  uint64_t s = context->jobContext->jobStatus.load ();
   return (s & TOTAL_MASK) >> 33;
 }
 
 K2 *maxCurKeyOfAllThreads (JobContext *jobContext)
 {
   K2 *curMax = nullptr;
-  bool allEmpty = true;
-  for (auto &thread: *jobContext->threads_context)
+  for (auto &thread: *jobContext->threadsContext)
   {
-    if (!thread->working_vec->empty ())
+    if (thread->workingVec->empty ())
     {
-        allEmpty = false;
-        K2 *curLast = thread->working_vec->back ().first;
-        if (curMax == nullptr || *curMax < *curLast)
-        {
-            curMax = curLast;
-        }
+      continue;
     }
-
-  }
-  if (allEmpty){
-      return nullptr;
+    K2 *curLast = thread->workingVec->back ().first;
+    if (curMax == nullptr || *curMax < *curLast)
+    {
+      curMax = curLast;
+    }
   }
   return curMax;
 }
@@ -90,90 +82,87 @@ void shuffleAll (ThreadContext *context)
 {
   while (doneJob (context) < totalJob (context))
   {
-    K2 *maxKey = maxCurKeyOfAllThreads (context->job_context);
-
-    if (maxKey == nullptr){
-        break;
-    }
+    K2 *maxKey = maxCurKeyOfAllThreads (context->jobContext);
 
     auto *newVec = new IntermediateVec ();
-    for (auto &thread: *context->job_context->threads_context)
+    for (auto &thread: *context->jobContext->threadsContext)
     {
-      if (thread->working_vec->empty ())
+      if (thread->workingVec->empty ())
       {
         continue;
       }
-      while (!thread->working_vec->empty () &&
-             !(*thread->working_vec->back ().first < *maxKey ||
-               *maxKey < *thread->working_vec->back ().first))
+      while (!thread->workingVec->empty () &&
+             !(*thread->workingVec->back ().first < *maxKey ||
+               *maxKey < *thread->workingVec->back ().first))
       {
-        newVec->push_back (thread->working_vec->back ());
-        thread->working_vec->pop_back ();
-        context->job_context->jobStatus.fetch_add (
+        newVec->push_back (thread->workingVec->back ());
+        thread->workingVec->pop_back ();
+        context->jobContext->jobStatus.fetch_add (
             1ULL << 2,
             std::memory_order_acq_rel
         );
       }
     }
-    context->job_context->reduceQueue->push (newVec);
+
+    context->jobContext->reduceQueue->push (newVec);
   }
 }
 
 void sortAndShuffleVec (ThreadContext *context)
 {
-  context->job_context->newPairsCounter.fetch_add (
-      context->working_vec->size (),
+  context->jobContext->newPairsCounter.fetch_add (
+      context->workingVec->size (),
       std::memory_order_relaxed);
 
-  std::sort (context->working_vec->begin (), context->working_vec->end (),
+  std::sort (context->workingVec->begin (), context->workingVec->end (),
              [] (IntermediatePair &a, IntermediatePair &b)
              {
                  return *(a.first) < *(b.first);
              });
 
-  context->job_context->pre_barrier->barrier ();
+  context->jobContext->preBarrier->barrier ();
 
   if (context->id == 0)
   {
     uint64_t packed = (uint64_t (SHUFFLE_STAGE) & 0b11)
-                      | (context->job_context->newPairsCounter.load () << 33);
-    context->job_context->jobStatus.store (packed, std::memory_order_release);
+                      | (context->jobContext->newPairsCounter.load () << 33);
+    context->jobContext->jobStatus.store (packed, std::memory_order_release);
 
     shuffleAll (context);
 
-    size_t totalSize = context->job_context->reduceQueue->size ();
+    size_t totalSize = context->jobContext->reduceQueue->size ();
     uint64_t packedReduce =
         (uint64_t (REDUCE_STAGE) & 0b11)
         | (uint64_t (totalSize) << 33);
-    context->job_context->jobStatus.store (packedReduce,
-                                           std::memory_order_release);
+    context->jobContext->jobStatus.store (packedReduce,
+                                          std::memory_order_release);
   }
 
-  context->job_context->post_barrier->barrier ();
+  context->jobContext->postBarrier->barrier ();
 }
 
 void undefinedStageInRoutine (ThreadContext *context)
 {
-  JobContext *jobContext = context->job_context;
+  JobContext *jobContext = context->jobContext;
 
   jobContext->undefStageMtx.lock ();
   if ((jobContext->jobStatus.load () & 0b11) == UNDEFINED_STAGE &&
       jobContext->inUndefinedStage)
   {
     jobContext->inUndefinedStage = false;
-    size_t totalSize = ((jobContext->input_vec->size ()));
+    size_t totalSize = ((jobContext->inputVec->size ()));
     uint64_t packedMap =
         (uint64_t (MAP_STAGE) & 0b11)
         | (uint64_t (totalSize) << 33);
-    context->job_context->jobStatus.store (packedMap,
-                                           std::memory_order_release);
+    context->jobContext->jobStatus.store (packedMap,
+                                          std::memory_order_release);
   }
   jobContext->undefStageMtx.unlock ();
 }
 
 void mapStageInRoutine (ThreadContext *context)
 {
-  JobContext *jobContext = context->job_context;
+  JobContext *jobContext = context->jobContext;
   bool moreToMap = false;
 
   jobContext->mapStageMtx.lock ();
@@ -193,7 +182,7 @@ void mapStageInRoutine (ThreadContext *context)
 
   if (moreToMap)
   {
-    auto pair = jobContext->input_vec->at (nextJob);
+    auto pair = jobContext->inputVec->at (nextJob);
     jobContext->client->map (pair.first, pair.second, context);
   }
   else
@@ -204,16 +193,17 @@ void mapStageInRoutine (ThreadContext *context)
 
 bool reduceStageInRoutine (ThreadContext *context)
 {
-  JobContext *jobContext = context->job_context;
+  JobContext *jobContext = context->jobContext;
   bool moreToReduce = false;
 
   jobContext->reduceStageMtx.lock ();
   IntermediateVec *nextJob;
-  if (doneJob (context) < totalJob (context))
+  if (doneJob (context) < totalJob (context)
+      && !jobContext->reduceQueue->empty ())
   {
     moreToReduce = true;
-    nextJob = context->job_context->reduceQueue->front ();
-    context->job_context->reduceQueue->pop ();
+    nextJob = context->jobContext->reduceQueue->front ();
+    context->jobContext->reduceQueue->pop ();
     jobContext->jobStatus.fetch_add (
         1ULL << 2,
         std::memory_order_acq_rel
@@ -240,7 +230,7 @@ bool reduceStageInRoutine (ThreadContext *context)
 
 void runRoutine (ThreadContext *context)
 {
-  JobContext *jobContext = context->job_context;
+  JobContext *jobContext = context->jobContext;
 
   while (true)
   {
@@ -253,7 +243,8 @@ void runRoutine (ThreadContext *context)
 
     if ((jobContext->jobStatus.load () & 0b11) == REDUCE_STAGE)
     {
-      if (!reduceStageInRoutine (context)){
+      if (!reduceStageInRoutine (context))
+      {
         break;
       }
     }
@@ -270,40 +261,56 @@ JobHandle startMapReduceJob (const MapReduceClient &client,
     std::exit (1);
   }
 
-  auto *job_context = new JobContext ();
+  auto *jobContext = new JobContext ();
 
-  job_context->client = &client;
-  job_context->input_vec = &inputVec;
-  job_context->output_vec = &outputVec;
-  job_context->inUndefinedStage = true;
+  jobContext->client = &client;
+  jobContext->inputVec = &inputVec;
+  jobContext->outputVec = &outputVec;
+  jobContext->inUndefinedStage = true;
 
-  job_context->pre_barrier = new Barrier (multiThreadLevel);
-  job_context->post_barrier = new Barrier (multiThreadLevel);
+  jobContext->preBarrier = new Barrier (multiThreadLevel);
+  jobContext->postBarrier = new Barrier (multiThreadLevel);
 
-  job_context->jobStatus.store ((uint64_t) UNDEFINED_STAGE);
-  job_context->isWaiting = false;
+  jobContext->jobStatus.store ((uint64_t) UNDEFINED_STAGE);
+  jobContext->isWaiting = false;
 
-  job_context->threads_context = new std::vector<ThreadContext *> ();
-  job_context->threads = new std::vector<std::thread *> ();
-  job_context->reduceQueue = new std::queue<IntermediateVec *> ();
+  jobContext->threadsContext = new std::vector<ThreadContext *> ();
+  jobContext->threads = new std::vector<std::thread *> ();
+  jobContext->reduceQueue = new std::queue<IntermediateVec *> ();
 
-  job_context->newPairsCounter.store (0);
+  jobContext->newPairsCounter.store (0);
 
-  for (int i = 0; i < multiThreadLevel; i++)
+  if (inputVec.empty ())
   {
-    auto *context = new ThreadContext{job_context, i, new IntermediateVec ()};
-    job_context->threads->push_back (new std::thread (runRoutine, context));
-    job_context->threads_context->push_back (context);
+    uint64_t packed = (uint64_t (REDUCE_STAGE) & 0b11)
+                      | (uint64_t (1) << 33) | (uint64_t (1) << 2);
+    jobContext->jobStatus.store (packed, std::memory_order_release);
+  }
+  else
+  {
+    for (int i = 0; i < multiThreadLevel; i++)
+    {
+      auto *context = new ThreadContext{jobContext, i,
+                                        new IntermediateVec ()};
+      auto *newThread = new (std::nothrow) std::thread (runRoutine, context);
+      if (newThread == nullptr)
+      {
+        std::cout << "system error: thread's creation failed.\n";
+        exit (1);
+      }
+      jobContext->threads->push_back (newThread);
+      jobContext->threadsContext->push_back (context);
+    }
   }
 
-  return (void *) job_context;
+  return (void *) jobContext;
 }
 
 void waitForJob (JobHandle job)
 {
   if (job == nullptr)
   {
-    std::cerr << "system error: Invalid JobHandle";
+    std::cout << "system error: Invalid JobHandle.\n";
     return;
   }
   auto jobContext = (JobContext *) job;
@@ -321,7 +328,7 @@ void getJobState (JobHandle job, JobState *state)
 {
   if (job == nullptr || state == nullptr)
   {
-    std::cerr << "system error: Invalid JobHandle or JobState";
+    std::cout << "system error: Invalid JobHandle or JobState.\n";
     return;
   }
 
@@ -346,15 +353,15 @@ void closeJobHandle (JobHandle job)
 {
   if (job == nullptr)
   {
-    std::cerr << "system error: Invalid JobHandle";
+    std::cout << "system error: Invalid JobHandle.\n";
     return;
   }
   waitForJob (job);
   auto *jobContext = (JobContext *) job;
 
-  for (auto &threadContext: *jobContext->threads_context)
+  for (auto &threadContext: *jobContext->threadsContext)
   {
-    delete threadContext->working_vec;
+    delete threadContext->workingVec;
     delete threadContext;
   }
   for (auto &thread: *jobContext->threads)
@@ -362,11 +369,11 @@ void closeJobHandle (JobHandle job)
     delete thread;
   }
 
-  delete jobContext->threads_context;
+  delete jobContext->threadsContext;
   delete jobContext->threads;
   delete jobContext->reduceQueue;
-  delete jobContext->pre_barrier;
-  delete jobContext->post_barrier;
+  delete jobContext->preBarrier;
+  delete jobContext->postBarrier;
 
   delete jobContext;
 }
@@ -375,23 +382,23 @@ void emit2 (K2 *key, V2 *value, void *context)
 {
   if (key == nullptr || value == nullptr || context == nullptr)
   {
-    std::cerr << "system error: Invalid args for emit2";
+    std::cout << "system error: Invalid args for emit2.\n";
     return;
   }
 
   auto threadContext = (ThreadContext *) context;
-  threadContext->working_vec->emplace_back (key, value);
+  threadContext->workingVec->emplace_back (key, value);
 }
 
 void emit3 (K3 *key, V3 *value, void *context)
 {
   if (key == nullptr || value == nullptr || context == nullptr)
   {
-    std::cerr << "system error: Invalid args for emit3";
+    std::cout << "system error: Invalid args for emit3.\n";
     return;
   }
   auto threadContext = (ThreadContext *) context;
-  threadContext->job_context->outputMtx.lock ();
-  threadContext->job_context->output_vec->emplace_back (key, value);
-  threadContext->job_context->outputMtx.unlock ();
+  threadContext->jobContext->outputMtx.lock ();
+  threadContext->jobContext->outputVec->emplace_back (key, value);
+  threadContext->jobContext->outputMtx.unlock ();
 }
