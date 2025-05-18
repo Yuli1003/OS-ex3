@@ -258,7 +258,7 @@ JobHandle startMapReduceJob (const MapReduceClient &client,
   if (multiThreadLevel <= 0 || multiThreadLevel > MAX_REASONABLE_THREAD_COUNT)
   {
     std::cout << "system error: Invalid number of threads.\n";
-    std::exit (1);
+    exit (1);
   }
 
   auto *jobContext = new JobContext ();
