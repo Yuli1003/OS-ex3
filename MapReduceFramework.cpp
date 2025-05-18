@@ -171,6 +171,7 @@ void runRoutine (ThreadContext *context)
   while (true)
   {
 
+
     // undefined stage
     jobContext->undefStageMtx.lock ();
     if ((jobContext->jobStatus.load () & 0b11) == UNDEFINED_STAGE &&
