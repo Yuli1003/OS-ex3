@@ -84,6 +84,10 @@ void shuffleAll (ThreadContext *context)
   {
     K2 *maxKey = maxCurKeyOfAllThreads (context->jobContext);
 
+    if (maxKey == nullptr){
+        break;
+    }
+
     auto *newVec = new IntermediateVec ();
     for (auto &thread: *context->jobContext->threadsContext)
     {
