@@ -66,17 +66,22 @@ uint64_t totalJob (ThreadContext *context)
 K2 *maxCurKeyOfAllThreads (JobContext *jobContext)
 {
   K2 *curMax = nullptr;
+  bool allEmpty = true;
   for (auto &thread: *jobContext->threads_context)
   {
-    if (thread->working_vec->empty ())
+    if (!thread->working_vec->empty ())
     {
-      continue;
+        allEmpty = false;
+        K2 *curLast = thread->working_vec->back ().first;
+        if (curMax == nullptr || *curMax < *curLast)
+        {
+            curMax = curLast;
+        }
     }
-    K2 *curLast = thread->working_vec->back ().first;
-    if (curMax == nullptr || *curMax < *curLast)
-    {
-      curMax = curLast;
-    }
+
+  }
+  if (allEmpty){
+      return nullptr;
   }
   return curMax;
 }
@@ -86,6 +91,10 @@ void shuffleAll (ThreadContext *context)
   while (doneJob (context) < totalJob (context))
   {
     K2 *maxKey = maxCurKeyOfAllThreads (context->job_context);
+
+    if (maxKey == nullptr){
+        break;
+    }
 
     auto *newVec = new IntermediateVec ();
     for (auto &thread: *context->job_context->threads_context)
@@ -106,7 +115,6 @@ void shuffleAll (ThreadContext *context)
         );
       }
     }
-
     context->job_context->reduceQueue->push (newVec);
   }
 }
