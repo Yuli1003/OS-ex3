@@ -8,7 +8,6 @@
 #include <atomic>
 #include <queue>
 #include <algorithm>
-#include "semaphore.h"
 
 static constexpr int MAX_REASONABLE_THREAD_COUNT = 10000;
 static constexpr uint64_t DONE_MASK = ((1ULL << 31) - 1) << 2;
@@ -43,14 +42,9 @@ typedef struct JobContext
     Barrier *preBarrier;
     Barrier *postBarrier;
 
-    //std::queue<IntermediateVec *> *reduceQueue;
-    std::vector<IntermediateVec *> *reduceQueue;
+    std::queue<IntermediateVec *> *reduceQueue;
 
     std::atomic<uint64_t> newPairsCounter;
-
-    sem_t shuffle_sem;
-    std::atomic<int> shuffle_phase_barrier;
-    std::atomic<int> reduceQueueCounter;
 
 } JobContext;
 
@@ -66,34 +60,10 @@ uint64_t totalJob (ThreadContext *context)
   return (s & TOTAL_MASK) >> 33;
 }
 
-#define GET_JC(context) (((ThreadContext*)(context))->jobContext)
-
-void shuffle_barrier(void *context){
-  int barrier_status = GET_JC(context)->shuffle_phase_barrier++;
-  if(barrier_status == ((int)GET_JC(context)->threadsContext->size())-1)
-  {
-    sem_post (&GET_JC(context)->shuffle_sem);
-  }
-  sem_wait(&GET_JC(context)->shuffle_sem);
-  sem_post (&GET_JC(context)->shuffle_sem);
-}
-
-
-
-bool compare_keys(K2* key1, K2* key2){
-  if (*key1<*key2 || *key2<*key1){
-    return false;
-  }
-  else{
-    return true;
-  }
-}
-
-
 K2 *maxCurKeyOfAllThreads (JobContext *jobContext)
 {
   K2 *curMax = nullptr;
-  for (const auto &thread: *jobContext->threadsContext)
+  for (auto &thread: *jobContext->threadsContext)
   {
     if (!thread->workingVec || thread->workingVec->empty ())
     {
@@ -101,7 +71,7 @@ K2 *maxCurKeyOfAllThreads (JobContext *jobContext)
     }
     IntermediatePair &curPair = thread->workingVec->back ();
     if (curPair.first == nullptr) {
-      continue;
+        continue;
     }
     if (curMax == nullptr || *curMax < *curPair.first)
     {
@@ -111,26 +81,14 @@ K2 *maxCurKeyOfAllThreads (JobContext *jobContext)
   return curMax;
 }
 
-K2 *choose_key(void* context) {
-  K2* curr_max = NULL;
-  for (const auto & cont: *GET_JC(context)->threadsContext){
-    if ((!cont->workingVec->empty())&&(curr_max==NULL ||*curr_max<*cont->workingVec
-        ->back().first ))
-      curr_max =cont->workingVec->back().first;
-
-  }
-  return curr_max;
-}
-
-
-
 void shuffleAll (ThreadContext *context)
 {
   while (doneJob (context) < totalJob (context))
   {
     K2 *maxKey = maxCurKeyOfAllThreads (context->jobContext);
+
     if (maxKey == nullptr){
-      break;
+        break;
     }
 
     auto *newVec = new IntermediateVec ();
@@ -140,10 +98,16 @@ void shuffleAll (ThreadContext *context)
       {
         continue;
       }
-      while (thread->workingVec && !thread->workingVec->empty () &&
-      (compare_keys (maxKey, thread->workingVec->back().first)))
+      while (thread->workingVec && !thread->workingVec->empty ())
+//             !(*thread->workingVec->back ().first < *maxKey ||
+//               *maxKey < *thread->workingVec->back ().first))
       {
-
+          IntermediatePair& currentPair = thread->workingVec->back();
+          if (currentPair.first == nullptr ||
+              (*currentPair.first < *maxKey || *maxKey < *currentPair.first)) {
+              // Key doesn't match, move to next thread
+              break;
+          }
         newVec->push_back (std::move(thread->workingVec->back()));
         thread->workingVec->pop_back ();
         context->jobContext->jobStatus.fetch_add (
@@ -153,11 +117,11 @@ void shuffleAll (ThreadContext *context)
       }
     }
 
-    if (!newVec->empty()) {
-      context->jobContext->reduceQueue->push_back(newVec);
-    } else {
-      delete newVec;  // Clean up if no elements were moved
-    }
+      if (!newVec->empty()) {
+          context->jobContext->reduceQueue->push(newVec);
+      } else {
+          delete newVec;  // Clean up if no elements were moved
+      }
   }
 }
 
@@ -199,8 +163,6 @@ void sortAndShuffleVec (ThreadContext *context)
     context->jobContext->jobStatus.store (packedReduce,
                                           std::memory_order_release);
   }
-
-  //shuffle_barrier(context);
 
   context->jobContext->postBarrier->barrier ();
 }
@@ -255,44 +217,42 @@ void mapStageInRoutine (ThreadContext *context)
   }
 }
 
-void reduceStageInRoutine (ThreadContext *context)
+bool reduceStageInRoutine (ThreadContext *context)
 {
   JobContext *jobContext = context->jobContext;
-  int key_to_process = GET_JC(context)->reduceQueueCounter--;
-  key_to_process -= 1;
-  if(key_to_process < 0){
-    return;
-  }
-  //bool moreToReduce = false;
+  bool moreToReduce = false;
 
   jobContext->reduceStageMtx.lock ();
-  //IntermediateVec *nextJob = nullptr;
+  IntermediateVec *nextJob = nullptr;
   if (doneJob (context) < totalJob (context)
       && !jobContext->reduceQueue->empty ())
   {
-    //moreToReduce = true;
-    //nextJob = context->jobContext->reduceQueue->front ();
-    auto job = GET_JC(context)->reduceQueue->at(key_to_process);
-    //context->jobContext->reduceQueue->pop ();
-    jobContext->client->reduce (job, context);
-    jobContext->jobStatus.fetch_add (1ULL << 2,std::memory_order_acq_rel);
+    moreToReduce = true;
+    nextJob = context->jobContext->reduceQueue->front ();
+    context->jobContext->reduceQueue->pop ();
+    jobContext->jobStatus.fetch_add (
+        1ULL << 2,
+        std::memory_order_acq_rel
+    );
+
   }
-//  else
-//  {
-//    moreToReduce = false;
-//  }
-//  jobContext->reduceStageMtx.unlock ();
-//
-//  if (moreToReduce)
-//  {
-//    jobContext->client->reduce (job, context);
-//  }
-//  else
-//  {
-//    return false;
-//  }
-//
-//  return true;
+  else
+  {
+    moreToReduce = false;
+  }
+  jobContext->reduceStageMtx.unlock ();
+
+  if (moreToReduce)
+  {
+    jobContext->client->reduce (nextJob, context);
+    delete nextJob;
+  }
+  else
+  {
+    return false;
+  }
+
+  return true;
 }
 
 void runRoutine (ThreadContext *context)
@@ -310,11 +270,10 @@ void runRoutine (ThreadContext *context)
 
     if ((jobContext->jobStatus.load () & 0b11) == REDUCE_STAGE)
     {
-      if (doneJob (context) == totalJob (context))
+      if (!reduceStageInRoutine (context))
       {
         break;
       }
-      reduceStageInRoutine(context);
     }
   }
 }
@@ -341,16 +300,10 @@ JobHandle startMapReduceJob (const MapReduceClient &client,
 
   jobContext->jobStatus.store ((uint64_t) UNDEFINED_STAGE);
   jobContext->isWaiting = false;
-  jobContext->shuffle_phase_barrier = 0;
 
   jobContext->threadsContext = new std::vector<ThreadContext *> ();
   jobContext->threads = new std::vector<std::thread *> ();
-  jobContext->reduceQueue = new std::vector<IntermediateVec *> ();
-
-  if (sem_init(&jobContext->shuffle_sem, 0, 0)!=0){
-    std::cerr<<"semaphore init failed"<<std::endl;
-    exit (1);
-  }
+  jobContext->reduceQueue = new std::queue<IntermediateVec *> ();
 
   jobContext->newPairsCounter.store (0);
 
@@ -445,13 +398,10 @@ void closeJobHandle (JobHandle job)
 
   delete jobContext->threadsContext;
   delete jobContext->threads;
-  for (const auto & vec:*jobContext->reduceQueue){
-    delete vec;
-  }
-
-  if (sem_destroy (&jobContext->shuffle_sem)!=0){
-    std::cerr<<"semamphre destroy failed"<<std::endl;
-    exit (1);
+  while (!jobContext->reduceQueue->empty()) {
+      IntermediateVec* vec = jobContext->reduceQueue->front();
+      jobContext->reduceQueue->pop();
+      delete vec;
   }
 
   delete jobContext->reduceQueue;
@@ -459,7 +409,6 @@ void closeJobHandle (JobHandle job)
   delete jobContext->postBarrier;
 
   delete jobContext;
-  job = NULL;
 }
 
 void emit2 (K2 *key, V2 *value, void *context)
