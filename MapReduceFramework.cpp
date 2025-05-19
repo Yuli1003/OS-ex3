@@ -47,7 +47,6 @@ typedef struct JobContext
     std::atomic<int> reduceQueueCounter;
 
     std::atomic<uint64_t> newPairsCounter;
-
 } JobContext;
 
 K2 *maxCurKeyOfAllThreads (JobContext *jobContext)
