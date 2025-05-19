@@ -2,7 +2,7 @@ CC=g++
 CXX=g++
 RANLIB=ranlib
 
-LIBSRC=MapReduceFramework.cpp
+LIBSRC=MapReduceFramework.cpp MapReduceFramework.h Barrier.cpp Barrier.h
 LIBOBJ=$(LIBSRC:.cpp=.o)
 
 INCS=-I.
@@ -31,3 +31,4 @@ depend:
 
 tar:
 	$(TAR) $(TARFLAGS) $(TARNAME) $(TARSRCS)
+.PHONY
