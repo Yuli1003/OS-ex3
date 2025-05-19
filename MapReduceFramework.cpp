@@ -76,6 +76,9 @@ K2 *maxCurKeyOfAllThreads (JobContext *jobContext)
 
 bool compareKeys (K2 *key1, K2 *key2)
 {
+  if (key1 == nullptr || key2 == nullptr) {
+    return false;
+  }
   if (*key1 < *key2 || *key2 < *key1)
   {
     return false;
@@ -206,7 +209,11 @@ void mapStageInRoutine (ThreadContext *context)
 void reduceStageInRoutine (ThreadContext *context)
 {
   JobContext *jobContext = context->jobContext;
+
+  jobContext->reduceStageMtx.lock();
   int keyToReduce = jobContext->reduceQueueCounter--;
+  jobContext->reduceStageMtx.unlock();
+
   keyToReduce--;
   if (keyToReduce < 0)
   {
