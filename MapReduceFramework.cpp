@@ -16,40 +16,42 @@ struct JobContext;
 
 typedef struct ThreadContext
 {
+    IntermediateVec *workingVec;
     JobContext *jobContext;
     int id;
-    IntermediateVec *workingVec;
 } ThreadContext;
+
 
 typedef struct JobContext
 {
-    std::vector<ThreadContext *> *threadsContext;
-    std::vector<std::thread *> *threads;
+    std::vector<ThreadContext *> *threadsContext{};
+    std::vector<std::thread *> *threads{};
 
-    MapReduceClient const *client;
-    InputVec const *inputVec;
-    OutputVec *outputVec;
-    std::atomic<uint64_t> jobStatus;
-    bool isWaiting;
-    bool inUndefinedStage;
+    MapReduceClient const *client{};
+    InputVec const *inputVec{};
+    OutputVec *outputVec{};
+    std::atomic<uint64_t> jobStatus{};
+    bool isWaiting{};
+    bool inUndefinedStage{};
 
     std::mutex outputMtx;
     std::mutex undefStageMtx;
     std::mutex mapStageMtx;
     std::mutex reduceStageMtx;
 
-    Barrier *preBarrier;
-    Barrier *prepreBarrier;
-    Barrier *postBarrier;
 
-    std::atomic<int> inputPairsCounter;
+    Barrier *preBarrier{};
+    Barrier *postBarrier{};
 
-    std::vector<IntermediateVec *> *reduceQueue;
-    std::atomic<int> reduceQueueCounter;
+    std::atomic<int> inputPairsCounter{};
 
-    std::atomic<uint64_t> newPairsCounter;
+    std::vector<IntermediateVec *> *reduceQueue{};
+    std::atomic<int> reduceQueueCounter{};
+
+    std::atomic<uint64_t> newPairsCounter{};
 
 } JobContext;
+
 
 K2 *maxCurKeyOfAllThreads (JobContext *jobContext)
 {
@@ -82,8 +84,32 @@ bool compareKeys (K2 *key1, K2 *key2)
   }
 }
 
+void moveToShuffleStage(ThreadContext *context){
+  uint64_t totalPairs = context->jobContext->newPairsCounter.load(std::memory_order_relaxed);
+  uint64_t packed = (uint64_t(SHUFFLE_STAGE) & 0b11)|( totalPairs << 33);
+  context->jobContext->jobStatus.store (packed, std::memory_order_release);
+}
+
+void moveToReduceStage(ThreadContext *context){
+  size_t totalSize = context->jobContext->reduceQueue->size();
+  uint64_t packedReduce =
+      (uint64_t (REDUCE_STAGE) & 0b11)
+      | (uint64_t (totalSize) << 33);
+  context->jobContext->jobStatus.store (packedReduce,std::memory_order_release);
+}
+
+void moveToMapStage(ThreadContext *context){
+  size_t totalSize = ((context->jobContext->inputVec->size ()));
+  uint64_t packedMap =
+      (uint64_t (MAP_STAGE) & 0b11)
+      | (uint64_t (totalSize) << 33);
+  context->jobContext->jobStatus.store (packedMap,
+                                        std::memory_order_release);
+}
+
 void shuffleAll (ThreadContext *context)
 {
+  moveToShuffleStage (context);
   context->jobContext->reduceQueue = new std::vector<IntermediateVec *> ();
 
   bool remainingVectors = true;
@@ -128,7 +154,6 @@ void sortAndShuffleVec (ThreadContext *context)
       context->workingVec->size (),
       std::memory_order_relaxed);
 
-  context->jobContext->preBarrier->barrier ();
 
   std::sort (context->workingVec->begin (), context->workingVec->end (),
              [] (IntermediatePair &a, IntermediatePair &b)
@@ -136,22 +161,20 @@ void sortAndShuffleVec (ThreadContext *context)
                  return *(a.first) < *(b.first);
              });
 
+  context->jobContext->preBarrier->barrier ();
   if (context->id == 0)
   {
-    uint64_t packed = (uint64_t (SHUFFLE_STAGE) & 0b11)
-                      | (context->jobContext->newPairsCounter.load () << 33);
-    context->jobContext->jobStatus.store (packed, std::memory_order_release);
+    moveToShuffleStage (context);
+    shuffleAll(context);
+  }
+  context->jobContext->postBarrier->barrier ();
 
-    shuffleAll (context);
-
-    size_t totalSize = context->jobContext->reduceQueue->size();
-    uint64_t packedReduce =
-        (uint64_t (REDUCE_STAGE) & 0b11)
-        | (uint64_t (totalSize) << 33);
-    context->jobContext->jobStatus.store (packedReduce,
-                                          std::memory_order_release);
+  if (context->id == 0)
+  {
+    moveToReduceStage(context);
   }
 }
+
 
 void undefinedStageInRoutine (ThreadContext *context)
 {
@@ -162,15 +185,11 @@ void undefinedStageInRoutine (ThreadContext *context)
       jobContext->inUndefinedStage)
   {
     jobContext->inUndefinedStage = false;
-    size_t totalSize = ((jobContext->inputVec->size ()));
-    uint64_t packedMap =
-        (uint64_t (MAP_STAGE) & 0b11)
-        | (uint64_t (totalSize) << 33);
-    context->jobContext->jobStatus.store (packedMap,
-                                          std::memory_order_release);
+    moveToMapStage(context);
   }
   jobContext->undefStageMtx.unlock ();
 }
+
 
 void mapStageInRoutine (ThreadContext *context)
 {
@@ -183,9 +202,7 @@ void mapStageInRoutine (ThreadContext *context)
   nextJob--;
   if (nextJob < 0)
   {
-    context->jobContext->prepreBarrier->barrier ();
     sortAndShuffleVec (context);
-    context->jobContext->postBarrier->barrier ();
     return;
   }
   else
@@ -199,6 +216,7 @@ void mapStageInRoutine (ThreadContext *context)
     jobContext->client->map (pair.first, pair.second, context);
   }
 }
+
 
 void reduceStageInRoutine (ThreadContext *context)
 {
@@ -226,7 +244,6 @@ void reduceStageInRoutine (ThreadContext *context)
   jobContext->client->reduce (nextJob, context);
 }
 
-
 void runRoutine (ThreadContext *context)
 {
   JobContext *jobContext = context->jobContext;
@@ -237,6 +254,7 @@ void runRoutine (ThreadContext *context)
     if ((jobContext->jobStatus.load () & 0b11) == MAP_STAGE)
     {
       mapStageInRoutine (context);
+
     }
 
     if ((jobContext->jobStatus.load () & 0b11) == REDUCE_STAGE)
@@ -269,7 +287,6 @@ JobHandle startMapReduceJob (const MapReduceClient &client,
   jobContext->inputPairsCounter.store ((int) jobContext->inputVec->size ());
 
   jobContext->preBarrier = new Barrier (multiThreadLevel);
-  jobContext->prepreBarrier = new Barrier (multiThreadLevel);
   jobContext->postBarrier = new Barrier (multiThreadLevel);
 
   jobContext->jobStatus.store ((uint64_t) UNDEFINED_STAGE);
@@ -277,10 +294,7 @@ JobHandle startMapReduceJob (const MapReduceClient &client,
 
   jobContext->threadsContext = new std::vector<ThreadContext *> ();
   jobContext->threads = new std::vector<std::thread *> ();
-
-  //jobContext->reduceQueue = new std::vector<IntermediateVec *> ();
   jobContext->reduceQueueCounter.store (0);
-
   jobContext->newPairsCounter.store (0);
 
   if (inputVec.empty ())
@@ -293,8 +307,8 @@ JobHandle startMapReduceJob (const MapReduceClient &client,
   {
     for (int i = 0; i < multiThreadLevel; i++)
     {
-      auto *context = new ThreadContext{jobContext, i,
-                                        new IntermediateVec ()};
+      auto *context = new ThreadContext{new IntermediateVec (),jobContext,i
+                                        };
       auto *newThread = new (std::nothrow) std::thread (runRoutine, context);
       if (newThread == nullptr)
       {
