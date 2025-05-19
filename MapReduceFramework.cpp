@@ -65,14 +65,17 @@ K2 *maxCurKeyOfAllThreads (JobContext *jobContext)
   K2 *curMax = nullptr;
   for (auto &thread: *jobContext->threadsContext)
   {
-    if (thread->workingVec->empty ())
+    if (!thread->workingVec || thread->workingVec->empty ())
     {
       continue;
     }
-    K2 *curLast = thread->workingVec->back ().first;
-    if (curMax == nullptr || *curMax < *curLast)
+    IntermediatePair &curPair = thread->workingVec->back ();
+    if (curPair.first == nullptr) {
+        continue;
+    }
+    if (curMax == nullptr || *curMax < *curPair.first)
     {
-      curMax = curLast;
+      curMax = curPair.first;
     }
   }
   return curMax;
@@ -95,12 +98,17 @@ void shuffleAll (ThreadContext *context)
       {
         continue;
       }
-      while (!thread->workingVec->empty () &&
-             !(*thread->workingVec->back ().first < *maxKey ||
-               *maxKey < *thread->workingVec->back ().first))
+      while (thread->workingVec && !thread->workingVec->empty ())
+//             !(*thread->workingVec->back ().first < *maxKey ||
+//               *maxKey < *thread->workingVec->back ().first))
       {
-
-        newVec->push_back (std::move(thread->workingVec->back ()));
+          IntermediatePair& currentPair = thread->workingVec->back();
+          if (currentPair.first == nullptr ||
+              (*currentPair.first < *maxKey || *maxKey < *currentPair.first)) {
+              // Key doesn't match, move to next thread
+              break;
+          }
+        newVec->push_back (std::move(thread->workingVec->back()));
         thread->workingVec->pop_back ();
         context->jobContext->jobStatus.fetch_add (
             1ULL << 2,
@@ -109,12 +117,25 @@ void shuffleAll (ThreadContext *context)
       }
     }
 
-    context->jobContext->reduceQueue->push (newVec);
+      if (!newVec->empty()) {
+          context->jobContext->reduceQueue->push(newVec);
+      } else {
+          delete newVec;  // Clean up if no elements were moved
+      }
   }
 }
 
 void sortAndShuffleVec (ThreadContext *context)
 {
+    auto it = context->workingVec->begin();
+    while (it != context->workingVec->end()) {
+        if (it->first == nullptr || it->second == nullptr) {
+            it = context->workingVec->erase(it);
+        } else {
+            ++it;
+        }
+    }
+
   context->jobContext->newPairsCounter.fetch_add (
       context->workingVec->size (),
       std::memory_order_relaxed);
@@ -376,6 +397,12 @@ void closeJobHandle (JobHandle job)
 
   delete jobContext->threadsContext;
   delete jobContext->threads;
+  while (!jobContext->reduceQueue->empty()) {
+      IntermediateVec* vec = jobContext->reduceQueue->front();
+      jobContext->reduceQueue->pop();
+      delete vec;
+  }
+
   delete jobContext->reduceQueue;
   delete jobContext->preBarrier;
   delete jobContext->postBarrier;
