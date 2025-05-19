@@ -75,6 +75,7 @@ K2 *maxCurKeyOfAllThreads (JobContext *jobContext)
   return curMax;
 }
 
+
 bool compareKeys (K2 *key1, K2 *key2)
 {
   if (*key1 < *key2 || *key2 < *key1)
