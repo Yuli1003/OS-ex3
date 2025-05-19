@@ -109,6 +109,7 @@ void shuffleAll (ThreadContext *context)
   }
 }
 
+
 void sortAndShuffleVec (ThreadContext *context)
 {
   auto it = context->workingVec->begin ();
