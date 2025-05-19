@@ -64,20 +64,12 @@ uint64_t totalJob (ThreadContext *context)
 K2 *maxCurKeyOfAllThreads (JobContext *jobContext)
 {
   K2 *curMax = nullptr;
-  for (auto &thread: *jobContext->threadsContext)
+  for (const auto &thread: *jobContext->threadsContext)
   {
-    if (!thread->workingVec || thread->workingVec->empty ())
+    if (!thread->workingVec->empty () &&
+        (curMax == nullptr || *curMax < *thread->workingVec->back ().first))
     {
-      continue;
-    }
-    IntermediatePair &curPair = thread->workingVec->back ();
-    if (curPair.first == nullptr)
-    {
-      continue;
-    }
-    if (curMax == nullptr || *curMax < *curPair.first)
-    {
-      curMax = curPair.first;
+      curMax = thread->workingVec->back ().first;
     }
   }
   return curMax;
