@@ -64,23 +64,27 @@ uint64_t totalJob (ThreadContext *context)
 K2 *maxCurKeyOfAllThreads (JobContext *jobContext)
 {
   K2 *curMax = nullptr;
-  for (auto &thread: *jobContext->threadsContext)
+  for (const auto &thread: *jobContext->threadsContext)
   {
-    if (!thread->workingVec || thread->workingVec->empty ())
+    if (!thread->workingVec->empty () &&
+        (curMax == nullptr || *curMax < *thread->workingVec->back ().first))
     {
-      continue;
-    }
-    IntermediatePair &curPair = thread->workingVec->back ();
-    if (curPair.first == nullptr)
-    {
-      continue;
-    }
-    if (curMax == nullptr || *curMax < *curPair.first)
-    {
-      curMax = curPair.first;
+      curMax = thread->workingVec->back ().first;
     }
   }
   return curMax;
+}
+
+bool compareKeys (K2 *key1, K2 *key2)
+{
+  if (*key1 < *key2 || *key2 < *key1)
+  {
+    return false;
+  }
+  else
+  {
+    return true;
+  }
 }
 
 void shuffleAll (ThreadContext *context)
@@ -96,8 +100,7 @@ void shuffleAll (ThreadContext *context)
     for (auto &thread: *context->jobContext->threadsContext)
     {
       while (!thread->workingVec->empty () &&
-             !(*thread->workingVec->back ().first < *maxKey ||
-               *maxKey < *thread->workingVec->back ().first))
+             compareKeys (maxKey, thread->workingVec->back ().first))
       {
         newVec->push_back (thread->workingVec->back ());
         thread->workingVec->pop_back ();
@@ -118,22 +121,8 @@ void shuffleAll (ThreadContext *context)
   }
 }
 
-
 void sortAndShuffleVec (ThreadContext *context)
 {
-  auto it = context->workingVec->begin ();
-  while (it != context->workingVec->end ())
-  {
-    if (it->first == nullptr || it->second == nullptr)
-    {
-      it = context->workingVec->erase (it);
-    }
-    else
-    {
-      ++it;
-    }
-  }
-
   context->jobContext->newPairsCounter.fetch_add (
       context->workingVec->size (),
       std::memory_order_relaxed);
