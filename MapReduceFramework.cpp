@@ -213,6 +213,7 @@ bool reduceStageInRoutine (ThreadContext *context)
         1ULL << 2,
         std::memory_order_acq_rel
     );
+
   }
   else
   {
