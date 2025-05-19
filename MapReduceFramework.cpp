@@ -42,7 +42,8 @@ typedef struct JobContext
     Barrier *preBarrier;
     Barrier *postBarrier;
 
-    std::queue<IntermediateVec *> *reduceQueue;
+    std::vector<IntermediateVec *> *reduceQueue;
+    std::atomic<int> reduceQueueCounter;
 
     std::atomic<uint64_t> newPairsCounter;
 
@@ -70,8 +71,9 @@ K2 *maxCurKeyOfAllThreads (JobContext *jobContext)
       continue;
     }
     IntermediatePair &curPair = thread->workingVec->back ();
-    if (curPair.first == nullptr) {
-        continue;
+    if (curPair.first == nullptr)
+    {
+      continue;
     }
     if (curMax == nullptr || *curMax < *curPair.first)
     {
@@ -83,58 +85,53 @@ K2 *maxCurKeyOfAllThreads (JobContext *jobContext)
 
 void shuffleAll (ThreadContext *context)
 {
-  while (doneJob (context) < totalJob (context))
+  bool remainingVectors = true;
+
+  while (remainingVectors)
   {
+    remainingVectors = false;
     K2 *maxKey = maxCurKeyOfAllThreads (context->jobContext);
-
-    if (maxKey == nullptr){
-        break;
-    }
-
     auto *newVec = new IntermediateVec ();
+
     for (auto &thread: *context->jobContext->threadsContext)
     {
-      if (thread->workingVec->empty ())
+      while (!thread->workingVec->empty () &&
+             !(*thread->workingVec->back ().first < *maxKey ||
+               *maxKey < *thread->workingVec->back ().first))
       {
-        continue;
-      }
-      while (thread->workingVec && !thread->workingVec->empty ())
-//             !(*thread->workingVec->back ().first < *maxKey ||
-//               *maxKey < *thread->workingVec->back ().first))
-      {
-          IntermediatePair& currentPair = thread->workingVec->back();
-          if (currentPair.first == nullptr ||
-              (*currentPair.first < *maxKey || *maxKey < *currentPair.first)) {
-              // Key doesn't match, move to next thread
-              break;
-          }
-        newVec->push_back (std::move(thread->workingVec->back()));
+        newVec->push_back (thread->workingVec->back ());
         thread->workingVec->pop_back ();
         context->jobContext->jobStatus.fetch_add (
             1ULL << 2,
             std::memory_order_acq_rel
         );
       }
+      if (!context->workingVec->empty ())
+      {
+        remainingVectors = true;
+      }
     }
 
-      if (!newVec->empty()) {
-          context->jobContext->reduceQueue->push(newVec);
-      } else {
-          delete newVec;  // Clean up if no elements were moved
-      }
+    context->jobContext->reduceQueue->push_back (newVec);
+    context->jobContext->reduceQueueCounter++;
   }
 }
 
+
 void sortAndShuffleVec (ThreadContext *context)
 {
-    auto it = context->workingVec->begin();
-    while (it != context->workingVec->end()) {
-        if (it->first == nullptr || it->second == nullptr) {
-            it = context->workingVec->erase(it);
-        } else {
-            ++it;
-        }
+  auto it = context->workingVec->begin ();
+  while (it != context->workingVec->end ())
+  {
+    if (it->first == nullptr || it->second == nullptr)
+    {
+      it = context->workingVec->erase (it);
     }
+    else
+    {
+      ++it;
+    }
+  }
 
   context->jobContext->newPairsCounter.fetch_add (
       context->workingVec->size (),
@@ -217,42 +214,26 @@ void mapStageInRoutine (ThreadContext *context)
   }
 }
 
-bool reduceStageInRoutine (ThreadContext *context)
+void reduceStageInRoutine (ThreadContext *context)
 {
   JobContext *jobContext = context->jobContext;
-  bool moreToReduce = false;
+  int keyToReduce = jobContext->reduceQueueCounter--;
+  keyToReduce--;
+  if (keyToReduce < 0)
+  {
+    return;
+  }
 
   jobContext->reduceStageMtx.lock ();
-  IntermediateVec *nextJob = nullptr;
-  if (doneJob (context) < totalJob (context)
-      && !jobContext->reduceQueue->empty ())
-  {
-    moreToReduce = true;
-    nextJob = context->jobContext->reduceQueue->front ();
-    context->jobContext->reduceQueue->pop ();
-    jobContext->jobStatus.fetch_add (
-        1ULL << 2,
-        std::memory_order_acq_rel
-    );
-
-  }
-  else
-  {
-    moreToReduce = false;
-  }
+  IntermediateVec *nextJob = jobContext->reduceQueue->at (keyToReduce);
   jobContext->reduceStageMtx.unlock ();
 
-  if (moreToReduce)
-  {
-    jobContext->client->reduce (nextJob, context);
-    delete nextJob;
-  }
-  else
-  {
-    return false;
-  }
+  jobContext->jobStatus.fetch_add (
+      1ULL << 2,
+      std::memory_order_acq_rel
+  );
 
-  return true;
+  jobContext->client->reduce (nextJob, context);
 }
 
 void runRoutine (ThreadContext *context)
@@ -270,10 +251,11 @@ void runRoutine (ThreadContext *context)
 
     if ((jobContext->jobStatus.load () & 0b11) == REDUCE_STAGE)
     {
-      if (!reduceStageInRoutine (context))
+      if (jobContext->reduceQueueCounter <= 0)
       {
         break;
       }
+      reduceStageInRoutine (context);
     }
   }
 }
@@ -303,7 +285,9 @@ JobHandle startMapReduceJob (const MapReduceClient &client,
 
   jobContext->threadsContext = new std::vector<ThreadContext *> ();
   jobContext->threads = new std::vector<std::thread *> ();
-  jobContext->reduceQueue = new std::queue<IntermediateVec *> ();
+
+  jobContext->reduceQueue = new std::vector<IntermediateVec *> ();
+  jobContext->reduceQueueCounter.store (0);
 
   jobContext->newPairsCounter.store (0);
 
@@ -398,10 +382,10 @@ void closeJobHandle (JobHandle job)
 
   delete jobContext->threadsContext;
   delete jobContext->threads;
-  while (!jobContext->reduceQueue->empty()) {
-      IntermediateVec* vec = jobContext->reduceQueue->front();
-      jobContext->reduceQueue->pop();
-      delete vec;
+
+  for (auto &vec: *jobContext->reduceQueue)
+  {
+    delete vec;
   }
 
   delete jobContext->reduceQueue;
