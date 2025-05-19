@@ -104,6 +104,7 @@ void shuffleAll (ThreadContext *context)
         context->jobContext->jobStatus.fetch_add (
             1ULL << 2,
             std::memory_order_acq_rel
+
         );
       }
       if (!context->workingVec->empty ())
