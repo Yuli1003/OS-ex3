@@ -254,7 +254,6 @@ void runRoutine (ThreadContext *context)
     if ((jobContext->jobStatus.load () & 0b11) == MAP_STAGE)
     {
       mapStageInRoutine (context);
-
     }
 
     if ((jobContext->jobStatus.load () & 0b11) == REDUCE_STAGE)
