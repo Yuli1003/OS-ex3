@@ -39,6 +39,7 @@ typedef struct JobContext
     std::mutex reduceStageMtx;
 
     Barrier *preBarrier;
+    Barrier *prepreBarrier;
     Barrier *postBarrier;
 
     std::atomic<int> inputPairsCounter;
@@ -98,6 +99,7 @@ void shuffleAll (ThreadContext *context)
       while (!thread->workingVec->empty () &&
              compareKeys (maxKey, thread->workingVec->back ().first))
       {
+
         newVec->push_back (thread->workingVec->back ());
         thread->workingVec->pop_back ();
 
@@ -114,22 +116,25 @@ void shuffleAll (ThreadContext *context)
     }
 
     context->jobContext->reduceQueue->push_back (newVec);
-    context->jobContext->reduceQueueCounter++;
+    context->jobContext->reduceQueueCounter.fetch_add (1);
   }
 }
 
 void sortAndShuffleVec (ThreadContext *context)
 {
+
+
   context->jobContext->newPairsCounter.fetch_add (
       context->workingVec->size (),
       std::memory_order_relaxed);
+
+  context->jobContext->preBarrier->barrier ();
 
   std::sort (context->workingVec->begin (), context->workingVec->end (),
              [] (IntermediatePair &a, IntermediatePair &b)
              {
                  return *(a.first) < *(b.first);
              });
-  context->jobContext->preBarrier->barrier ();
 
   if (context->id == 0)
   {
@@ -146,7 +151,6 @@ void sortAndShuffleVec (ThreadContext *context)
     context->jobContext->jobStatus.store (packedReduce,
                                           std::memory_order_release);
   }
-  context->jobContext->postBarrier->barrier ();
 }
 
 void undefinedStageInRoutine (ThreadContext *context)
@@ -173,13 +177,15 @@ void mapStageInRoutine (ThreadContext *context)
   JobContext *jobContext = context->jobContext;
 
   jobContext->mapStageMtx.lock ();
-  int nextJob = jobContext->inputPairsCounter--;
+  int nextJob = jobContext->inputPairsCounter.fetch_add (-1);
   jobContext->mapStageMtx.unlock ();
 
   nextJob--;
   if (nextJob < 0)
   {
+    context->jobContext->prepreBarrier->barrier ();
     sortAndShuffleVec (context);
+    context->jobContext->postBarrier->barrier ();
     return;
   }
   else
@@ -199,7 +205,7 @@ void reduceStageInRoutine (ThreadContext *context)
   JobContext *jobContext = context->jobContext;
 
   jobContext->reduceStageMtx.lock ();
-  int keyToReduce = jobContext->reduceQueueCounter--;
+  int keyToReduce = jobContext->reduceQueueCounter.fetch_add (-1);
   jobContext->reduceStageMtx.unlock ();
 
   keyToReduce--;
@@ -263,6 +269,7 @@ JobHandle startMapReduceJob (const MapReduceClient &client,
   jobContext->inputPairsCounter.store ((int) jobContext->inputVec->size ());
 
   jobContext->preBarrier = new Barrier (multiThreadLevel);
+  jobContext->prepreBarrier = new Barrier (multiThreadLevel);
   jobContext->postBarrier = new Barrier (multiThreadLevel);
 
   jobContext->jobStatus.store ((uint64_t) UNDEFINED_STAGE);
