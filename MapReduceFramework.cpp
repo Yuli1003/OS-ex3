@@ -99,7 +99,8 @@ void shuffleAll (ThreadContext *context)
              !(*thread->workingVec->back ().first < *maxKey ||
                *maxKey < *thread->workingVec->back ().first))
       {
-        newVec->push_back (thread->workingVec->back ());
+
+        newVec->push_back (std::move(thread->workingVec->back ()));
         thread->workingVec->pop_back ();
         context->jobContext->jobStatus.fetch_add (
             1ULL << 2,
@@ -201,7 +202,7 @@ bool reduceStageInRoutine (ThreadContext *context)
   bool moreToReduce = false;
 
   jobContext->reduceStageMtx.lock ();
-  IntermediateVec *nextJob;
+  IntermediateVec *nextJob = nullptr;
   if (doneJob (context) < totalJob (context)
       && !jobContext->reduceQueue->empty ())
   {
