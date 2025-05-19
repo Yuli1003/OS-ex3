@@ -6,7 +6,6 @@
 #include "MapReduceClient.h"
 #include "MapReduceFramework.h"
 #include <atomic>
-#include <queue>
 #include <algorithm>
 
 static constexpr int MAX_REASONABLE_THREAD_COUNT = 10000;
@@ -111,7 +110,7 @@ void shuffleAll (ThreadContext *context)
 
         );
       }
-      if (!context->workingVec->empty ())
+      if (!thread->workingVec->empty ())
       {
         remainingVectors = true;
       }
