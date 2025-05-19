@@ -41,24 +41,14 @@ typedef struct JobContext
     Barrier *preBarrier;
     Barrier *postBarrier;
 
+    std::atomic<int> inputPairsCounter;
+
     std::vector<IntermediateVec *> *reduceQueue;
     std::atomic<int> reduceQueueCounter;
 
     std::atomic<uint64_t> newPairsCounter;
 
 } JobContext;
-
-uint64_t doneJob (ThreadContext *context)
-{
-  uint64_t s = context->jobContext->jobStatus.load ();
-  return (s & DONE_MASK) >> 2;
-}
-
-uint64_t totalJob (ThreadContext *context)
-{
-  uint64_t s = context->jobContext->jobStatus.load ();
-  return (s & TOTAL_MASK) >> 33;
-}
 
 K2 *maxCurKeyOfAllThreads (JobContext *jobContext)
 {
@@ -74,10 +64,10 @@ K2 *maxCurKeyOfAllThreads (JobContext *jobContext)
   return curMax;
 }
 
-
 bool compareKeys (K2 *key1, K2 *key2)
 {
-  if (key1 == nullptr || key2 == nullptr) {
+  if (key1 == nullptr || key2 == nullptr)
+  {
     return false;
   }
   if (*key1 < *key2 || *key2 < *key1)
@@ -179,31 +169,25 @@ void undefinedStageInRoutine (ThreadContext *context)
 void mapStageInRoutine (ThreadContext *context)
 {
   JobContext *jobContext = context->jobContext;
-  bool moreToMap = false;
 
   jobContext->mapStageMtx.lock ();
-  uint64_t nextJob;
-  if (doneJob (context) < totalJob (context))
-  {
-    moreToMap = true;
-    nextJob = doneJob (context);
-    jobContext->jobStatus.fetch_add (1ULL << 2,
-                                     std::memory_order_acq_rel);
-  }
-  else
-  {
-    moreToMap = false;
-  }
+  int nextJob = jobContext->inputPairsCounter--;
   jobContext->mapStageMtx.unlock ();
 
-  if (moreToMap)
+  nextJob--;
+  if (nextJob < 0)
   {
-    auto pair = jobContext->inputVec->at (nextJob);
-    jobContext->client->map (pair.first, pair.second, context);
+    sortAndShuffleVec (context);
   }
   else
   {
-    sortAndShuffleVec (context);
+    jobContext->mapStageMtx.lock ();
+    auto pair = jobContext->inputVec->at (nextJob);
+    jobContext->mapStageMtx.unlock ();
+
+    jobContext->jobStatus.fetch_add (1ULL << 2,
+                                     std::memory_order_acq_rel);
+    jobContext->client->map (pair.first, pair.second, context);
   }
 }
 
@@ -211,9 +195,9 @@ void reduceStageInRoutine (ThreadContext *context)
 {
   JobContext *jobContext = context->jobContext;
 
-  jobContext->reduceStageMtx.lock();
+  jobContext->reduceStageMtx.lock ();
   int keyToReduce = jobContext->reduceQueueCounter--;
-  jobContext->reduceStageMtx.unlock();
+  jobContext->reduceStageMtx.unlock ();
 
   keyToReduce--;
   if (keyToReduce < 0)
@@ -273,6 +257,7 @@ JobHandle startMapReduceJob (const MapReduceClient &client,
   jobContext->inputVec = &inputVec;
   jobContext->outputVec = &outputVec;
   jobContext->inUndefinedStage = true;
+  jobContext->inputPairsCounter.store ((int) jobContext->inputVec->size ());
 
   jobContext->preBarrier = new Barrier (multiThreadLevel);
   jobContext->postBarrier = new Barrier (multiThreadLevel);
