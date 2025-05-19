@@ -48,7 +48,6 @@ typedef struct JobContext
 
 } JobContext;
 
-
 uint64_t doneJob (ThreadContext *context)
 {
   uint64_t s = context->jobContext->jobStatus.load ();
