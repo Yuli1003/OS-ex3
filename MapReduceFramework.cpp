@@ -204,6 +204,7 @@ void sortAndShuffleVec (ThreadContext *context)
   context->jobContext->postBarrier->barrier ();
 }
 
+
 void undefinedStageInRoutine (ThreadContext *context)
 {
   JobContext *jobContext = context->jobContext;
