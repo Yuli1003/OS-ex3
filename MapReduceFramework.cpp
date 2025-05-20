@@ -223,75 +223,88 @@ void mapStageInRoutine (ThreadContext *context)
 {
   JobContext *jobContext = context->jobContext;
 
-  jobContext->mapStageMtx.lock ();
-  int nextJob = jobContext->inputPairsCounter.fetch_add (-1);
-  jobContext->mapStageMtx.unlock ();
+  while (true) {
+    jobContext->mapStageMtx.lock ();
+    int nextJob = jobContext->inputPairsCounter.fetch_add (-1);
+    jobContext->mapStageMtx.unlock ();
 
-  nextJob--;
-  if (nextJob < 0)
-  {
-    sortAndShuffleVec (context);
-    return;
-  }
-  else
-  {
-    jobContext->inputVecMtx.lock ();
-    auto pair = jobContext->inputVec->at (nextJob);
-    jobContext->inputVecMtx.unlock ();
+    nextJob--;
+    if (nextJob < 0)
+    {
+      //sortAndShuffleVec (context);
+      return;
+    }
+    else
+    {
+      jobContext->inputVecMtx.lock ();
+      auto pair = jobContext->inputVec->at (nextJob);
+      jobContext->inputVecMtx.unlock ();
 
-    jobContext->jobStatus.fetch_add (1ULL << 2,
-                                     std::memory_order_acq_rel);
-    jobContext->client->map (pair.first, pair.second, context);
+      jobContext->jobStatus.fetch_add (1ULL << 2,
+                                       std::memory_order_acq_rel);
+      jobContext->client->map (pair.first, pair.second, context);
+    }
   }
 }
 
 void reduceStageInRoutine (ThreadContext *context)
 {
   JobContext *jobContext = context->jobContext;
+  while (true) {
+    jobContext->reduceStageMtx.lock ();
+    int keyToReduce = jobContext->reduceQueueCounter.fetch_add (-1);
+    jobContext->reduceStageMtx.unlock ();
 
-  jobContext->reduceStageMtx.lock ();
-  int keyToReduce = jobContext->reduceQueueCounter.fetch_add (-1);
-  jobContext->reduceStageMtx.unlock ();
+    keyToReduce--;
+    if (keyToReduce < 0)
+    {
+      return;
+    }
 
-  keyToReduce--;
-  if (keyToReduce < 0)
-  {
-    return;
+    jobContext->reduceStageMtx.lock ();
+    IntermediateVec *nextJob = jobContext->reduceQueue->at (keyToReduce);
+    jobContext->reduceStageMtx.unlock ();
+
+    jobContext->jobStatus.fetch_add (
+        1ULL << 2,
+        std::memory_order_acq_rel
+    );
+
+    jobContext->client->reduce (nextJob, context);
   }
-
-  jobContext->reduceStageMtx.lock ();
-  IntermediateVec *nextJob = jobContext->reduceQueue->at (keyToReduce);
-  jobContext->reduceStageMtx.unlock ();
-
-  jobContext->jobStatus.fetch_add (
-      1ULL << 2,
-      std::memory_order_acq_rel
-  );
-
-  jobContext->client->reduce (nextJob, context);
 }
 
+//void runRoutine (ThreadContext *context)
+//{
+//  JobContext *jobContext = context->jobContext;
+//  while (true)
+//  {
+//    undefinedStageInRoutine (context);
+//
+//    if ((jobContext->jobStatus.load () & 0b11) == MAP_STAGE)
+//    {
+//      mapStageInRoutine (context);
+//    }
+//
+//    if ((jobContext->jobStatus.load () & 0b11) == REDUCE_STAGE)
+//    {
+//      if (jobContext->reduceQueueCounter <= 0)
+//      {
+//        return;
+//      }
+//      reduceStageInRoutine (context);
+//    }
+//  }
+//}
 void runRoutine (ThreadContext *context)
 {
-  JobContext *jobContext = context->jobContext;
-  while (true)
-  {
-    undefinedStageInRoutine (context);
+  undefinedStageInRoutine (context);
 
-    if ((jobContext->jobStatus.load () & 0b11) == MAP_STAGE)
-    {
-      mapStageInRoutine (context);
-    }
+  mapStageInRoutine (context);
 
-    if ((jobContext->jobStatus.load () & 0b11) == REDUCE_STAGE)
-    {
-      if (jobContext->reduceQueueCounter <= 0)
-      {
-        return;
-      }
-      reduceStageInRoutine (context);
-    }
-  }
+  sortAndShuffleVec (context);
+
+  reduceStageInRoutine (context);
 }
 
 JobHandle startMapReduceJob (const MapReduceClient &client,
