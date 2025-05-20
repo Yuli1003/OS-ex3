@@ -15,6 +15,7 @@ static constexpr uint64_t TOTAL_MASK = ~((1ULL << 33) - 1);
 
 struct JobContext;
 
+
 typedef struct ThreadContext
 {
     IntermediateVec *workingVec;
